@@ -1,0 +1,9 @@
+streamlit
+boto3
+python-dotenv
+PyMuPDF
+pydantic
+tqdm>=4.65.0
+indic-nlp-library>=0.91
+sentencepiece>=0.1.99
+protobuf>=3.20.0
