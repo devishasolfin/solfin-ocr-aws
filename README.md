@@ -294,7 +294,7 @@ This project provides a robust Python-based pipeline for extracting structured d
 
 ---
 
-## ⚙️ 1. Python API Setup
+##  1. Python API Setup
 
 The provided `ocr_engine4.py` is a processing module. To integrate it with Java/JS, you must expose it as a REST API. We recommend using **FastAPI**.
 
@@ -348,7 +348,7 @@ GROQ_API_KEY=your_groq_api_key
 
 ---
 
-## ☕ 2. Java Backend Integration (Spring Boot)
+##  2. Java Backend Integration (Spring Boot)
 
 The Java backend acts as the gateway. It receives the file from the frontend and forwards it to the Python API.
 
