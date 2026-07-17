@@ -212,7 +212,7 @@ GROQ_API_KEY=xxxxxxxxxxxxxxxx
 Start Streamlit
 
 ```bash
-streamlit run app4.py
+streamlit run app.py
 ```
 
 The application will be available at
