@@ -505,7 +505,7 @@ async function uploadBill() {
    - LLM API calls and PDF rendering can take 10-20 seconds. Ensure your Java `RestTemplate` and Frontend `fetch` timeouts are configured to handle long-running requests (e.g., set timeout to 60 seconds).
 
 
-# Future Improvements
+## Future Improvements
 
 - Textract Forms & Tables API
 - Layout-aware extraction
@@ -525,7 +525,7 @@ async function uploadBill() {
 
 ---
 
-# Applications
+## Applications
 
 - Loan underwriting
 - KYC verification
@@ -536,13 +536,179 @@ async function uploadBill() {
 - Financial document automation
 
 ---
+# Input image threshold
+To apply a quality threshold at the input stage, we need to evaluate the image/PDF **before** sending it to the expensive and slow AWS Textract and Groq LLM pipelines. 
 
-# Performance Considerations
+We can use **OpenCV** and **NumPy** to check for:
+1. **File Size** (Rejects corrupted or blank files).
+2. **Resolution** (Rejects tiny thumbnails).
+3. **Blur/Sharpness** (Uses Laplacian Variance to detect blurry scans).
+4. **Brightness/Exposure** (Rejects images that are too dark or washed out).
 
-The current architecture prioritizes:
+Here is how to integrate this quality gate into your `ocr_engine4.py`.
 
-- Low latency
-- Deterministic extraction
-- JSON consistency
-- Validation before output
-- Extensible extraction schema
+### 1. Add Dependencies
+First, ensure you have OpenCV and NumPy installed:
+```bash
+pip install opencv-python numpy
+```
+
+### 2. Updated `ocr_engine4.py` Code
+Add the following imports, the quality check function, and inject it into the `pipeline_extract` function.
+
+```python
+import os
+import json
+import re
+import fitz
+import boto3
+import cv2
+import numpy as np
+from groq import Groq
+from pydantic import BaseModel, Field
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ... (Initialize AWS and Groq clients as before) ...
+# ... (Define UtilityBillSchema as before) ...
+
+# --- CUSTOM EXCEPTION FOR QUALITY GATE ---
+class LowQualityDocumentError(Exception):
+    """Raised when the uploaded document fails quality thresholds."""
+    pass
+
+def check_document_quality(file_bytes: bytes, filename: str):
+    """Evaluates the quality of the uploaded document before processing."""
+    
+    # 1. File Size Threshold (Reject files < 10KB to prevent blank/corrupted uploads)
+    if len(file_bytes) < 10000:
+        raise LowQualityDocumentError("File size is too small. The document might be corrupted or blank.")
+
+    # Helper function to analyze an image array using OpenCV
+    def analyze_image(img_array):
+        nparr = np.frombuffer(img_array, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            raise LowQualityDocumentError("Could not decode image. The file format might be unsupported or corrupted.")
+            
+        h, w = img.shape[:2]
+        
+        # 2. Resolution Check (Only for native images, not PDFs)
+        if not filename.lower().endswith('.pdf'):
+            if w < 500 or h < 500:
+                raise LowQualityDocumentError("Image resolution is too low. Please upload a clearer, higher-resolution image.")
+                
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 3. Blur Detection (Laplacian Variance)
+        # Lower variance = more blurry. 
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        # Thresholds: < 80 for native images, < 40 for 1x PDF renders
+        threshold = 40.0 if filename.lower().endswith('.pdf') else 80.0
+        if blur_score < threshold:
+            raise LowQualityDocumentError("The document is too blurry. Please upload a sharper image or scan.")
+            
+        # 4. Brightness/Exposure Check
+        brightness = np.mean(gray)
+        if brightness < 40:
+            raise LowQualityDocumentError("The document is too dark. Please ensure adequate lighting.")
+        elif brightness > 235:
+            raise LowQualityDocumentError("The document is too bright/washed out. Please adjust lighting and retry.")
+
+    # Apply checks based on file type
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')):
+        analyze_image(file_bytes)
+        
+    elif filename.lower().endswith('.pdf'):
+        # For PDFs, render the first page at 1x scale (without the 4x OCR upscale) 
+        # to check the native quality of the scan.
+        pdf = fitz.open(stream=file_bytes, filetype="pdf")
+        if pdf.page_count == 0:
+            raise LowQualityDocumentError("The PDF has no pages.")
+        page = pdf[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1)) # 1x scale for accurate quality check
+        analyze_image(pix.tobytes("png"))
+    else:
+        raise LowQualityDocumentError("Unsupported file format. Please upload a PDF, PNG, or JPG.")
+
+def pipeline_extract(uploaded_file) -> dict:
+    """Pipelines image ingestion, upscales matrices, executes layout OCR, and triggers Llama schema parsing."""
+    file_bytes = uploaded_file.read()
+    filename = uploaded_file.name.lower()
+    
+    # ==========================================
+    # INPUT STAGE: QUALITY THRESHOLD CHECK
+    # ==========================================
+    try:
+        check_document_quality(file_bytes, filename)
+    except LowQualityDocumentError as e:
+        # Return a structured error so the Java backend can catch it and show a UI message
+        return {"error": "LOW_QUALITY_DOCUMENT", "details": str(e)}
+    except Exception as e:
+        return {"error": "QUALITY_CHECK_FAILED", "details": str(e)}
+    # ==========================================
+
+    combined_raw_text = ""
+    
+    if filename.endswith(".pdf"):
+        pdf = fitz.open(stream=file_bytes, filetype="pdf")
+        for page_no in range(len(pdf)):
+            page = pdf[page_no]
+            # Now apply the 4x upscale for the actual OCR process
+            pix = page.get_pixmap(matrix=fitz.Matrix(4, 4))
+            img_bytes = pix.tobytes("png")
+            combined_raw_text += f"\n{extract_raw_text_via_textract(img_bytes)}"
+    else:
+        combined_raw_text = extract_raw_text_via_textract(file_bytes)
+        
+    parsed_data = process_text_with_llama(combined_raw_text)
+    
+    if isinstance(parsed_data, dict) and "error" not in parsed_data:
+        parsed_data["_raw_text"] = combined_raw_text
+        
+    return parsed_data
+```
+
+### 3. How to Handle This in Your Java/FastAPI Backend
+
+Because we are returning a specific error code (`"LOW_QUALITY_DOCUMENT"`), you can easily map this to an HTTP `400 Bad Request` so the frontend knows to prompt the user to re-upload.
+
+**In your FastAPI `main.py`:**
+```python
+@app.post("/api/extract-bill")
+async def extract_bill(file: UploadFile = File(...)):
+    result = pipeline_extract(file)
+    
+    # Catch the specific quality gate error
+    if result.get("error") == "LOW_QUALITY_DOCUMENT":
+        raise HTTPException(status_code=400, detail=result["details"])
+        
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["details"])
+        
+    return result
+```
+
+**In your Java Backend (Spring Boot):**
+When calling the Python API, catch the `HttpClientErrorException` for 400 status codes:
+```java
+try {
+    ResponseEntity<UtilityBillResponse> response = restTemplate.exchange(...);
+    return response.getBody();
+} catch (HttpClientErrorException e) {
+    if (e.getStatusCode() == HttpStatus.BAD_REQUEST) {
+        // Throw a custom exception to send to the Frontend
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getResponseBodyAsString());
+    }
+    throw e;
+}
+```
+
+### Tuning the Thresholds
+If you find the system is rejecting valid documents or accepting bad ones, you can tweak these numbers in the `analyze_image` function:
+* **Blur Score (`< 80.0`)**: Lower this number (e.g., `50.0`) if it's rejecting slightly blurry but readable bills. Raise it (e.g., `120.0`) if it's accepting very blurry bills.
+* **Brightness (`< 40` or `> 235`)**: Adjust these bounds if your users are scanning documents in dimly lit rooms or under harsh fluorescent lights.
